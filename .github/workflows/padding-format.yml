@@ -47,11 +47,14 @@ jobs:
           python3 dev/ci/check-suites.py
       - name: Verify generated padding documentation
         run: |
-          mkdir -p docs/source/user-guide/latest/compatibility/expressions
-          ./mvnw -B -Pspark-${{ matrix.spark }},generate-docs package -DskipTests
+          doc_root="$GITHUB_WORKSPACE/target/padding-docs"
+          mkdir -p "$doc_root"
+          cp -R docs/source/user-guide/latest/. "$doc_root/"
+          cp "$doc_root/compatibility/expressions/_category_template/"*.md "$doc_root/compatibility/expressions/"
+          ./mvnw -B -Pspark-${{ matrix.spark }},generate-docs package -DskipTests -Dexec.arguments="$doc_root"
           python3 - <<'PY'
           from pathlib import Path
-          text = Path('docs/source/user-guide/latest/expressions.md').read_text()
+          text = Path('target/padding-docs/expressions.md').read_text()
           for function in ('lpad', 'rpad'):
               row = next(line for line in text.splitlines() if line.startswith(f'| `{function}` |'))
               assert '| Hybrid |' in row, row
@@ -67,5 +70,7 @@ jobs:
           path: |
             target/source-sha.txt
             padding-format.patch
+            target/padding-docs/expressions.md
+            target/padding-docs/compatibility/expressions/string.md
             **/target/scalastyle-result.xml
           retention-days: 7
