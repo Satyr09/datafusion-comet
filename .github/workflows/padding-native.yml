@@ -1,0 +1,36 @@
+name: Padding native build
+
+on:
+  push:
+    branches: [ci/5579-padding-validation]
+    paths: [.github/workflows/padding-native.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    container: rust:bookworm
+    env:
+      RUSTFLAGS: -Ctarget-cpu=x86-64-v3 -Clink-arg=-fuse-ld=bfd
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-builder
+        with:
+          rust-version: stable
+          jdk-version: 17
+      - name: Build release library
+        run: cargo build --manifest-path native/Cargo.toml --release --locked
+      - name: Record native source
+        run: git rev-parse HEAD:native > native/target/release/native-tree.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: padding-native-release
+          path: |
+            native/target/release/libcomet.so
+            native/target/release/native-tree.txt
+          retention-days: 7
