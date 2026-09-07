@@ -28,14 +28,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - name: Record source
-        run: git rev-parse HEAD > source-sha.txt
+        run: |
+          mkdir -p target
+          git rev-parse HEAD > target/source-sha.txt
       - name: Apply Scala formatting
         run: |
           ./mvnw -B -Pspark-4.0,semanticdb compile test-compile scalafix:scalafix -DskipTests -Dscalastyle.skip=true -Dspotless.skip=true
           ./mvnw -B -Pspark-4.0 spotless:apply
       - name: Check style and licenses
         run: |
-          ./mvnw -B -Pspark-4.0 scalastyle:check
+          ./mvnw -B -Pspark-4.0 install -DskipTests
           ./mvnw -B -N apache-rat:check
           python3 dev/ci/check-benchmark-runner.py
           python3 dev/ci/check-suites.py
@@ -47,7 +49,7 @@ jobs:
         with:
           name: padding-format
           path: |
-            source-sha.txt
+            target/source-sha.txt
             padding-format.patch
             **/target/scalastyle-result.xml
           retention-days: 7

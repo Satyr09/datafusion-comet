@@ -23,10 +23,19 @@ jobs:
         with:
           rust-version: stable
           jdk-version: 17
-      - name: Build release library
-        run: cargo build --manifest-path native/Cargo.toml --release --locked
       - name: Record native source
-        run: git rev-parse HEAD:native > native/target/release/native-tree.txt
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p native/target/release
+          git rev-parse HEAD:native > native/target/release/native-tree.txt
+      - uses: actions/cache@v4
+        with:
+          path: native/target/release/libcomet.so
+          key: padding-release-${{ hashFiles('native/target/release/native-tree.txt') }}
+        id: library-cache
+      - name: Build release library
+        if: steps.library-cache.outputs.cache-hit != 'true'
+        run: cargo build --manifest-path native/Cargo.toml --release --locked
       - uses: actions/upload-artifact@v4
         with:
           name: padding-native-release
