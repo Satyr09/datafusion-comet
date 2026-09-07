@@ -52,7 +52,7 @@ jobs:
           script: |
             for (let attempt = 0; attempt < 160; attempt++) {
               const {data: run} = await github.rest.actions.getWorkflowRun({
-                ...context.repo, run_id: 34128153301
+                ...context.repo, run_id: 34131110438
               });
               if (run.status === 'completed') {
                 if (run.conclusion !== 'success') throw new Error(`Native build: ${run.conclusion}`);
@@ -66,7 +66,7 @@ jobs:
           name: padding-native-release
           path: native/target/release
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: 34128153301
+          run-id: 34131110438
       - name: Verify native source and install
         run: |
           test "$(git rev-parse HEAD:native)" = "$(cat native/target/release/native-tree.txt)"
