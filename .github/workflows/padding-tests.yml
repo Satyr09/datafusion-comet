@@ -1,0 +1,107 @@
+name: Padding tests
+
+on:
+  push:
+    branches: [ci/5579-padding-validation]
+    paths: [.github/workflows/padding-tests.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - spark: '3.4'
+            java: '11'
+          - spark: '3.5'
+            java: '17'
+          - spark: '4.0'
+            java: '17'
+          - spark: '4.1'
+            java: '17'
+    env:
+      MAVEN_OPTS: -Xmx3g
+      SPARK_LOCAL_HOSTNAME: localhost
+      SPARK_LOCAL_IP: 127.0.0.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/5579-padding-codegen-dispatch
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Record source and compile tests
+        run: |
+          git rev-parse HEAD > source-sha.txt
+          ./mvnw -B -Pspark-${{ matrix.spark }} test-compile -DskipTests -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee compile.log
+      - name: Wait for native release build
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (let attempt = 0; attempt < 160; attempt++) {
+              const {data: run} = await github.rest.actions.getWorkflowRun({
+                ...context.repo, run_id: 34128153301
+              });
+              if (run.status === 'completed') {
+                if (run.conclusion !== 'success') throw new Error(`Native build: ${run.conclusion}`);
+                return;
+              }
+              await new Promise(resolve => setTimeout(resolve, 30000));
+            }
+            throw new Error('Native build did not finish');
+      - uses: actions/download-artifact@v4
+        with:
+          name: padding-native-release
+          path: native/target/release
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 34128153301
+      - name: Verify native source and install
+        run: |
+          test "$(git rev-parse HEAD:native)" = "$(cat native/target/release/native-tree.txt)"
+          ./mvnw -B -Pspark-${{ matrix.spark }},release install -DskipTests -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee install.log
+      - name: Run string and SQL padding suites
+        run: |
+          export SPARK_HOME="$GITHUB_WORKSPACE"
+          export COMET_CONF_DIR="$GITHUB_WORKSPACE/conf"
+          ./mvnw -B -Pspark-${{ matrix.spark }},release test -Dtest=none '-Dsuites=org.apache.comet.CometStringExpressionSuite,org.apache.comet.CometSqlFileTestSuite string_lpad,org.apache.comet.CometSqlFileTestSuite string_rpad' -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee tests.log
+      - name: Verify generated padding documentation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('docs/source/user-guide/latest/expressions.md').read_text()
+          for function in ('lpad', 'rpad'):
+              row = next(line for line in text.splitlines() if line.startswith(f'| `{function}` |'))
+              assert '| Hybrid |' in row, row
+              print(row)
+          PY
+      - name: Run release benchmark
+        if: matrix.spark == '4.0'
+        run: |
+          extra_args=$(./mvnw -q -Pspark-4.0 help:evaluate -DforceStdout -Dexpression=extraJavaTestArgs)
+          export MAVEN_OPTS="-Xmx3g $extra_args"
+          export SPARK_GENERATE_BENCHMARK_FILES=1
+          cd spark
+          ../mvnw -B -Pspark-4.0,release exec:java -Dexec.classpathScope=test -Dexec.cleanupDaemonThreads=false -Dexec.mainClass=org.apache.spark.sql.benchmark.CometPaddingExpressionBenchmark 2>&1 | tee ../benchmark.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: padding-tests-${{ matrix.spark }}
+          path: |
+            source-sha.txt
+            *.log
+            **/target/surefire-reports
+            **/target/unit-tests.log
+            spark/benchmarks/CometPaddingExpressionBenchmark*
+          retention-days: 7
