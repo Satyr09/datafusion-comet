@@ -47,6 +47,7 @@ jobs:
           python3 dev/ci/check-suites.py
       - name: Verify generated padding documentation
         run: |
+          mkdir -p docs/source/user-guide/latest/compatibility/expressions
           ./mvnw -B -Pspark-${{ matrix.spark }},generate-docs package -DskipTests
           python3 - <<'PY'
           from pathlib import Path
