@@ -1,0 +1,99 @@
+name: Padding regression proof
+
+on:
+  push:
+    branches: [ci/5579-padding-validation]
+    paths: [.github/workflows/padding-regression.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MAVEN_OPTS: -Xmx3g
+      SPARK_LOCAL_HOSTNAME: localhost
+      SPARK_LOCAL_IP: 127.0.0.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/5579-padding-codegen-dispatch
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: maven
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Verify reference artifact provenance
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {data: run} = await github.rest.actions.getWorkflowRun({
+              owner: 'apache', repo: 'datafusion-comet', run_id: 34125645605
+            });
+            if (run.head_sha !== '7f1e00189b1ed86f1cb5acd872d97fce694482b1') {
+              throw new Error(`Unexpected artifact source: ${run.head_sha}`);
+            }
+      - uses: actions/download-artifact@v4
+        with:
+          repository: apache/datafusion-comet
+          name: native-lib-linux
+          path: native/target/release
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: 34125645605
+      - name: Verify native tree and install
+        run: |
+          test "$(git rev-parse HEAD:native)" = 6573ccf3eed747299b5bf2c567e0641668560b8c
+          git rev-parse HEAD > source-sha.txt
+          ./mvnw -B -Pspark-4.0,release install -DskipTests -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee install.log
+      - name: Verify padding with the fix
+        run: |
+          export SPARK_HOME="$GITHUB_WORKSPACE"
+          export COMET_CONF_DIR="$GITHUB_WORKSPACE/conf"
+          ./mvnw -B -Pspark-4.0,release test -Dtest=none '-Dsuites=org.apache.comet.CometStringExpressionSuite lpad,org.apache.comet.CometStringExpressionSuite rpad,org.apache.comet.CometSqlFileTestSuite string_lpad,org.apache.comet.CometSqlFileTestSuite string_rpad' -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee padding.log
+      - name: Verify the new tests detect the original behavior
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('spark/src/main/scala/org/apache/comet/serde/strings.scala')
+          text = path.read_text()
+          for name in ('StringLPad', 'StringRPad'):
+              before = f'object Comet{name} extends CometExpressionSerde[{name}] with CodegenDispatchFallback'
+              assert text.count(before) == 1
+              text = text.replace(before, f'object Comet{name} extends CometExpressionSerde[{name}]')
+          path.write_text(text)
+          PY
+          export SPARK_HOME="$GITHUB_WORKSPACE"
+          export COMET_CONF_DIR="$GITHUB_WORKSPACE/conf"
+          set +e
+          ./mvnw -B -Pspark-4.0,release test -Dtest=none '-Dsuites=org.apache.comet.CometStringExpressionSuite dispatches unsupported argument shapes' -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee regression.log
+          result=${PIPESTATUS[0]}
+          set -e
+          git restore spark/src/main/scala/org/apache/comet/serde/strings.scala
+          test "$result" -ne 0
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          reports = list(Path('spark/target/surefire-reports').glob('TEST-*CometStringExpressionSuite*.xml'))
+          cases = [case for report in reports for case in ET.parse(report).iter('testcase')
+                   if 'dispatches unsupported argument shapes' in case.attrib.get('name', '')]
+          assert len(cases) == 2, [(case.attrib, list(case)) for case in cases]
+          assert all(case.find('failure') is not None and case.find('error') is None for case in cases)
+          print('Both new dispatch tests fail when the two dispatcher mixins are removed.')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: padding-regression
+          path: |
+            source-sha.txt
+            *.log
+            **/target/surefire-reports
+            **/target/unit-tests.log
+          retention-days: 7
