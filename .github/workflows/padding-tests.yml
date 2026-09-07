@@ -9,6 +9,10 @@ permissions:
   contents: read
   actions: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     runs-on: ubuntu-24.04
@@ -44,7 +48,8 @@ jobs:
           sudo apt-get install -y protobuf-compiler
       - name: Record source and compile tests
         run: |
-          git rev-parse HEAD > source-sha.txt
+          mkdir -p target
+          git rev-parse HEAD > target/source-sha.txt
           ./mvnw -B -Pspark-${{ matrix.spark }} test-compile -DskipTests -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee compile.log
       - name: Wait for native release build
         uses: actions/github-script@v7
@@ -92,14 +97,29 @@ jobs:
           extra_args=$(./mvnw -q -Pspark-4.0 help:evaluate -DforceStdout -Dexpression=extraJavaTestArgs)
           export MAVEN_OPTS="-Xmx3g $extra_args"
           export SPARK_GENERATE_BENCHMARK_FILES=1
+          export COMET_CONF_DIR="$GITHUB_WORKSPACE/conf"
           cd spark
           ../mvnw -B -Pspark-4.0,release exec:java -Dexec.classpathScope=test -Dexec.cleanupDaemonThreads=false -Dexec.mainClass=org.apache.spark.sql.benchmark.CometPaddingExpressionBenchmark 2>&1 | tee ../benchmark.log
+      - name: Verify benchmark results
+        if: matrix.spark == '4.0'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path('benchmark.log').read_text()
+          for engine in ('Spark', 'Comet'):
+              results = re.findall(rf'^{engine}\s+[0-9]', text, re.MULTILINE)
+              assert len(results) == 6, (engine, len(results))
+          for warning in ('WARNING: the Comet plan', 'WARNING: the Spark baseline', 'WARNING: these projections'):
+              assert warning not in text, warning
+          print('All six benchmark cases produced Spark and Comet timings without plan warnings.')
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: padding-tests-${{ matrix.spark }}
           path: |
-            source-sha.txt
+            target/source-sha.txt
             *.log
             **/target/surefire-reports
             **/target/unit-tests.log
