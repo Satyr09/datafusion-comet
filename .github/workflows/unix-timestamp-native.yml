@@ -1,0 +1,49 @@
+name: Unix timestamp native build
+
+on:
+  push:
+    branches: [ci/5577-unix-timestamp-validation]
+    paths: [.github/workflows/unix-timestamp-native.yml]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    container: rust:bookworm
+    env:
+      RUSTFLAGS: -Ctarget-cpu=x86-64-v3 -Clink-arg=-fuse-ld=bfd
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-builder
+        with:
+          rust-version: stable
+          jdk-version: 17
+      - name: Record native source
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p native/target/release
+          git rev-parse HEAD:native > native/target/release/native-tree.txt
+      - uses: actions/cache@v4
+        with:
+          path: native/target/release/libcomet.so
+          key: unix-timestamp-release-${{ hashFiles('native/target/release/native-tree.txt') }}
+        id: library-cache
+      - name: Build release library
+        if: steps.library-cache.outputs.cache-hit != 'true'
+        run: cargo build --manifest-path native/Cargo.toml --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unix-timestamp-native-release
+          path: |
+            native/target/release/libcomet.so
+            native/target/release/native-tree.txt
+          retention-days: 7
