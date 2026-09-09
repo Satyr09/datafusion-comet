@@ -1,0 +1,80 @@
+name: Unix timestamp formatting
+
+on:
+  push:
+    branches: [ci/5577-unix-timestamp-validation]
+    paths: [.github/workflows/unix-timestamp-format.yml]
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        spark: ['3.5', '4.0']
+    env:
+      MAVEN_OPTS: -Xmx3g
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a63008c38a13b77dba7fa0a1930d9577f38b7808
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: maven
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Record source
+        run: |
+          mkdir -p target
+          git rev-parse HEAD > target/source-sha.txt
+      - name: Apply Scala formatting
+        run: |
+          ./mvnw -B -Pspark-${{ matrix.spark }},semanticdb compile test-compile scalafix:scalafix -DskipTests -Dscalastyle.skip=true -Dspotless.skip=true
+          ./mvnw -B -Pspark-${{ matrix.spark }} spotless:apply
+      - name: Check style and licenses
+        run: |
+          ./mvnw -B -Pspark-${{ matrix.spark }} install -DskipTests
+          ./mvnw -B -N apache-rat:check
+          python3 dev/ci/check-benchmark-runner.py
+          python3 dev/ci/check-suites.py
+      - name: Verify generated unix-timestamp documentation
+        run: |
+          doc_root="$GITHUB_WORKSPACE/target/unix-timestamp-docs"
+          mkdir -p "$doc_root"
+          cp -R docs/source/user-guide/latest/. "$doc_root/"
+          cp "$doc_root/compatibility/expressions/_category_template/"*.md "$doc_root/compatibility/expressions/"
+          ./mvnw -B -Pspark-${{ matrix.spark }},generate-docs package -DskipTests -Dexec.arguments="$doc_root"
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('target/unix-timestamp-docs/expressions.md').read_text()
+          for function in ('unix_timestamp',):
+              row = next(line for line in text.splitlines() if line.startswith(f'| `{function}` |'))
+              assert '| Hybrid |' in row, row
+              print(row)
+          PY
+      - name: Save formatting changes
+        if: always()
+        run: git diff --binary > unix-timestamp-format.patch
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unix-timestamp-format-${{ matrix.spark }}
+          path: |
+            target/source-sha.txt
+            unix-timestamp-format.patch
+            target/unix-timestamp-docs/expressions.md
+            target/unix-timestamp-docs/compatibility/expressions/datetime.md
+            **/target/scalastyle-result.xml
+          retention-days: 7
