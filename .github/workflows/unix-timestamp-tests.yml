@@ -38,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a63008c38a13b77dba7fa0a1930d9577f38b7808
+          ref: 7b2dfcd8cc06bd3db78579acfffc4fb42050a7d3
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
