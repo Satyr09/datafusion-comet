@@ -1,10 +1,12 @@
 name: Unix timestamp follow-up validation
 
 on:
-  push:
-    branches: [ci/5789-review-followup]
-    paths: [.github/workflows/unix-timestamp-followup.yml]
   workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run the Spark suites as well as formatting checks
+        type: boolean
+        default: true
 
 defaults:
   run:
@@ -16,6 +18,7 @@ permissions:
 
 jobs:
   test:
+    if: inputs.run_tests
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -133,9 +136,12 @@ jobs:
         run: |
           mkdir -p target
           git rev-parse HEAD > target/source-sha.txt
-      - name: Apply Scala formatting
+      - name: Run semantic Scala checks on the supported profile
+        if: matrix.spark == '4.0'
         run: |
           ./mvnw -B -Pspark-${{ matrix.spark }},semanticdb compile test-compile scalafix:scalafix -DskipTests -Dscalastyle.skip=true -Dspotless.skip=true
+      - name: Apply Scala formatting
+        run: |
           ./mvnw -B -Pspark-${{ matrix.spark }} spotless:apply
           git diff --exit-code
       - name: Check style and licenses
@@ -176,3 +182,30 @@ jobs:
             target/unix-timestamp-docs/compatibility/expressions/datetime.md
             **/target/scalastyle-result.xml
           retention-days: 30
+
+  scalafix-syntactic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 29a77851e7d1b72eaafe5cdf884ac72bf32cf4ef
+      - uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:21
+      - name: Fetch scalafix
+        run: |
+          for attempt in 1 2 3; do
+            if cs launch scalafix:0.14.6 -- --version; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+      - name: Check syntax across all Spark sources
+        run: |
+          cs launch --mode offline scalafix:0.14.6 -- \
+            --check --syntactic --config .scalafix-syntactic.conf \
+            --exclude '**/target/**' spark
