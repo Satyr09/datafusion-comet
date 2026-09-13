@@ -1,4 +1,4 @@
-name: Unix timestamp native build
+name: Unix timestamp review validation
 
 on:
   push:
@@ -12,17 +12,20 @@ defaults:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   native:
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 150
     container: rust:bookworm
     env:
       RUSTFLAGS: -Ctarget-cpu=x86-64-v3 -Clink-arg=-fuse-ld=bfd
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: eac00028c74124e9b3b18a6f7968ba4947a6d80c
       - uses: ./.github/actions/setup-builder
         with:
           rust-version: stable
@@ -31,7 +34,12 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           mkdir -p native/target/release
+          git rev-parse HEAD > native/target/release/source-sha.txt
           git rev-parse HEAD:native > native/target/release/native-tree.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+          shared-key: unix-timestamp-review-release
       - uses: actions/cache@v4
         with:
           path: native/target/release/libcomet.so
@@ -39,11 +47,314 @@ jobs:
         id: library-cache
       - name: Build release library
         if: steps.library-cache.outputs.cache-hit != 'true'
-        run: cargo build --manifest-path native/Cargo.toml --release --locked
+        run: cargo build --manifest-path native/Cargo.toml --release --locked 2>&1 | tee native-build.log
+      - name: Test native unix timestamp conversion
+        run: |
+          export LD_LIBRARY_PATH="$JAVA_HOME/lib/server:${LD_LIBRARY_PATH:-}"
+          cargo test --manifest-path native/Cargo.toml --release --locked -p datafusion-comet-spark-expr --lib datetime_funcs::unix_timestamp::tests -- --nocapture 2>&1 | tee native-tests.log
+          grep -F 'test result: ok. 4 passed;' native-tests.log
       - uses: actions/upload-artifact@v4
         with:
           name: unix-timestamp-native-release
           path: |
             native/target/release/libcomet.so
             native/target/release/native-tree.txt
+            native/target/release/source-sha.txt
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unix-timestamp-native-logs
+          path: |
+            native-build.log
+            native-tests.log
+          retention-days: 7
+
+  test:
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - spark: '3.4'
+            java: '11'
+          - spark: '3.5'
+            java: '17'
+          - spark: '4.0'
+            java: '17'
+          - spark: '4.1'
+            java: '17'
+          - spark: '4.2'
+            java: '17'
+    env:
+      MAVEN_OPTS: -Xmx3g
+      SPARK_LOCAL_HOSTNAME: localhost
+      SPARK_LOCAL_IP: 127.0.0.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: eac00028c74124e9b3b18a6f7968ba4947a6d80c
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Record source and compile tests
+        run: |
+          mkdir -p target
+          git rev-parse HEAD > target/source-sha.txt
+          ./mvnw -B -Pspark-${{ matrix.spark }} test-compile -DskipTests -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee compile.log
+      - uses: actions/download-artifact@v4
+        with:
+          name: unix-timestamp-native-release
+          path: native/target/release
+      - name: Verify native source and install
+        run: |
+          test "$(git rev-parse HEAD)" = "$(cat native/target/release/source-sha.txt)"
+          test "$(git rev-parse HEAD:native)" = "$(cat native/target/release/native-tree.txt)"
+          ./mvnw -B -Pspark-${{ matrix.spark }},release install -DskipTests -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee install.log
+      - name: Run temporal and SQL unix timestamp suites
+        run: |
+          export SPARK_HOME="$GITHUB_WORKSPACE"
+          export COMET_CONF_DIR="$GITHUB_WORKSPACE/conf"
+          ./mvnw -B -Pspark-${{ matrix.spark }},release test -Dtest=none '-Dsuites=org.apache.comet.CometTemporalExpressionSuite,org.apache.comet.CometSqlFileTestSuite unix_timestamp' -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee tests.log
+      - name: Verify expression support documentation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('docs/source/user-guide/latest/expressions.md').read_text()
+          for function in ('unix_timestamp',):
+              row = next(line for line in text.splitlines() if line.startswith(f'| `{function}` |'))
+              assert '| Hybrid |' in row, row
+              print(row)
+          PY
+      - name: Add matched dispatch-disabled benchmark and plan checks
+        if: matrix.spark == '4.0'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('spark/src/test/scala/org/apache/spark/sql/benchmark/CometBenchmarkBase.scala')
+          s = p.read_text()
+          start = s.index('  final def runExpressionBenchmark(')
+          end = s.index('  protected def excludedRulesWith', start)
+          section = s[start:end]
+          marker = '    benchmark.addCase("Spark") { _ =>'
+          assert section.count(marker) == 1
+          insert = """    val dispatchDisabledConfigs = cometConfigs :+
+                (CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> "false")
+              for ((label, configs) <- Seq(
+                  "dispatch enabled" -> cometConfigs,
+                  "dispatch disabled" -> dispatchDisabledConfigs)) {
+                withSQLConf(configs: _*) {
+                  val df = spark.sql(query)
+                  df.noop()
+                  val plan = stripAQEPlan(df.queryExecution.executedPlan)
+                  val info = new org.apache.comet.ExtendedExplainInfo()
+                  println(s"BENCHMARK PLAN [$name] [$label]\\n${info.generateExtendedInfo(plan)}")
+                  if (query.contains("unix_timestamp(ts)")) {
+                    require(info.getNativeExpressions(plan).contains("unix_timestamp"))
+                    require(!info.getCodegenDispatchExpressions(plan).contains("unix_timestamp"))
+                  } else if (label == "dispatch enabled") {
+                    require(info.getCodegenDispatchExpressions(plan).contains("unix_timestamp"))
+                    require(!info.getNativeExpressions(plan).contains("unix_timestamp"))
+                    require(findFirstNonCometOperator(plan).isEmpty)
+                  } else {
+                    require(!info.getCodegenDispatchExpressions(plan).contains("unix_timestamp"))
+                    require(!info.getNativeExpressions(plan).contains("unix_timestamp"))
+                    require(findFirstNonCometOperator(plan).isDefined)
+                  }
+                }
+              }
+
+          """
+          section = section.replace(marker, insert + marker)
+          marker = '    benchmark.run()'
+          assert section.count(marker) == 1
+          section = section.replace(marker, """    benchmark.addCase("Comet (dispatch disabled)") { _ =>
+                withSQLConf(dispatchDisabledConfigs: _*) {
+                  spark.sql(query).noop()
+                }
+              }
+
+          """ + marker)
+          p.write_text(s[:start] + section + s[end:])
+          PY
+          git diff --binary > target/benchmark-comparison.patch
+          ./mvnw -B -Pspark-4.0,release test-compile -DskipTests -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee benchmark-compile.log
+      - name: Record benchmark environment
+        if: matrix.spark == '4.0'
+        run: |
+          uname -a | tee benchmark-environment.log
+          lscpu >> benchmark-environment.log
+          java -version 2>> benchmark-environment.log
+      - name: Run release benchmark
+        if: matrix.spark == '4.0'
+        run: |
+          extra_args=$(./mvnw -q -Pspark-4.0 help:evaluate -DforceStdout -Dexpression=extraJavaTestArgs)
+          export MAVEN_OPTS="-Xmx3g $extra_args"
+          export SPARK_GENERATE_BENCHMARK_FILES=1
+          export COMET_CONF_DIR="$GITHUB_WORKSPACE/conf"
+          cd spark
+          ../mvnw -B -Pspark-4.0,release exec:java -Dexec.classpathScope=test -Dexec.cleanupDaemonThreads=false -Dexec.mainClass=org.apache.spark.sql.benchmark.CometUnixTimestampBenchmark 2>&1 | tee ../benchmark.log
+      - name: Verify benchmark results
+        if: matrix.spark == '4.0'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path('benchmark.log').read_text()
+          for engine in ('Spark', 'Comet'):
+              results = re.findall(rf'^{engine}\s+[0-9]', text, re.MULTILINE)
+              assert len(results) == 5, (engine, len(results))
+          for warning in ('WARNING: the Comet plan', 'WARNING: the Spark baseline', 'WARNING: these projections'):
+              assert warning not in text, warning
+          disabled = re.findall(r'^Comet \(dispatch disabled\)\s+[0-9]', text, re.MULTILINE)
+          assert len(disabled) == 5, len(disabled)
+          assert text.count('BENCHMARK PLAN') == 10
+          print('All five cases produced Spark, dispatch-enabled and dispatch-disabled timings with verified plans.')
+          PY
+      - name: Prove the dispatch tests fail without the fix
+        if: matrix.spark == '4.0'
+        run: |
+          git restore spark/src/test/scala/org/apache/spark/sql/benchmark/CometBenchmarkBase.scala
+          cp -R spark/target/surefire-reports target/parity-reports
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('spark/src/main/scala/org/apache/comet/serde/datetime.scala')
+          s = p.read_text()
+          old = 'object CometUnixTimestamp\n    extends CometExpressionSerde[UnixTimestamp]\n    with CodegenDispatchFallback {'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'object CometUnixTimestamp extends CometExpressionSerde[UnixTimestamp] {'))
+          PY
+          export SPARK_HOME="$GITHUB_WORKSPACE"
+          export COMET_CONF_DIR="$GITHUB_WORKSPACE/conf"
+          set +e
+          ./mvnw -B -Pspark-4.0,release test -Dtest=none '-Dsuites=org.apache.comet.CometTemporalExpressionSuite unix_timestamp' -Dspotless.skip=true -Dscalastyle.skip=true 2>&1 | tee regression.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -ne 0
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          failures = set()
+          for p in Path('spark/target/surefire-reports').glob('*.xml'):
+              for case in ET.parse(p).getroot().iter('testcase'):
+                  if case.find('failure') is not None:
+                      failures.add(case.attrib['name'])
+                  assert case.find('error') is None, case.attrib
+          expected = {
+              'unix_timestamp - string input uses codegen dispatch',
+              'unix_timestamp - collated strings use codegen even when native is opted into',
+          }
+          assert failures == expected, failures
+          print('Both string dispatch regressions fail when only the mixin is removed; typed inputs remain native.')
+          PY
+          git restore spark/src/main/scala/org/apache/comet/serde/datetime.scala
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unix-timestamp-tests-${{ matrix.spark }}
+          path: |
+            target/source-sha.txt
+            target/parity-reports
+            target/benchmark-comparison.patch
+            *.log
+            **/target/surefire-reports
+            **/target/unit-tests.log
+            spark/benchmarks/CometUnixTimestampBenchmark*
+          retention-days: 7
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        spark: ['3.5', '4.0']
+    env:
+      MAVEN_OPTS: -Xmx3g
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: eac00028c74124e9b3b18a6f7968ba4947a6d80c
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: maven
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Record source
+        run: |
+          mkdir -p target
+          git rev-parse HEAD > target/source-sha.txt
+      - name: Apply Scala formatting
+        run: |
+          ./mvnw -B -Pspark-${{ matrix.spark }},semanticdb compile test-compile scalafix:scalafix -DskipTests -Dscalastyle.skip=true -Dspotless.skip=true
+          ./mvnw -B -Pspark-${{ matrix.spark }} spotless:apply
+      - name: Check style and licenses
+        run: |
+          ./mvnw -B -Pspark-${{ matrix.spark }} install -DskipTests
+          ./mvnw -B -N apache-rat:check
+          python3 dev/ci/check-benchmark-runner.py
+          python3 dev/ci/check-suites.py
+      - name: Verify generated unix-timestamp documentation
+        run: |
+          doc_root="$GITHUB_WORKSPACE/target/unix-timestamp-docs"
+          mkdir -p "$doc_root"
+          cp -R docs/source/user-guide/latest/. "$doc_root/"
+          cp "$doc_root/compatibility/expressions/_category_template/"*.md "$doc_root/compatibility/expressions/"
+          ./mvnw -B -Pspark-${{ matrix.spark }},generate-docs package -DskipTests -Dexec.arguments="$doc_root"
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('target/unix-timestamp-docs/expressions.md').read_text()
+          for function in ('unix_timestamp',):
+              row = next(line for line in text.splitlines() if line.startswith(f'| `{function}` |'))
+              assert '| Hybrid |' in row, row
+              print(row)
+          PY
+      - name: Save formatting changes
+        if: always()
+        run: git diff --binary > unix-timestamp-format.patch
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unix-timestamp-format-${{ matrix.spark }}
+          path: |
+            target/source-sha.txt
+            unix-timestamp-format.patch
+            target/unix-timestamp-docs/expressions.md
+            target/unix-timestamp-docs/compatibility/expressions/datetime.md
+            **/target/scalastyle-result.xml
+          retention-days: 7
+  rust-format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container: rust:bookworm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: eac00028c74124e9b3b18a6f7968ba4947a6d80c
+      - name: Check Rust formatting
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rustup component add rustfmt
+          cargo fmt --manifest-path native/Cargo.toml --all -- --check
+      - name: Save Rust formatting changes
+        if: always()
+        run: |
+          cargo fmt --manifest-path native/Cargo.toml --all
+          git diff --binary > unix-timestamp-rust-format.patch
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unix-timestamp-rust-format
+          path: unix-timestamp-rust-format.patch
           retention-days: 7
